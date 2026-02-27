@@ -69,24 +69,36 @@ def main():
             time_relative = time_data - time_data[0]
             
             # 4. 使用 Matplotlib 绘制曲线
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
             
-            # --- 绘制子图 1: 肌电信号 (EMG) ---
-            # 为了画面整洁，我们只画前 3 个通道的 EMG 信号
-            for channel in range(3):
-                ax1.plot(time_relative, emg_data[:, channel], label=f'EMG 通道 {channel+1}', alpha=0.8)
-            ax1.set_title('肌电信号 (EMG) - 前3个通道', fontsize=14)
-            ax1.set_ylabel('振幅', fontsize=12)
-            ax1.legend(loc='upper right')
+            # --- 绘制子图 1: 肌电信号 (EMG) 所有通道堆叠显示 ---
+            num_emg_channels = emg_data.shape[1]
+            
+            # 计算一个合适的间距用于将信号堆叠 (使用信号幅度的最大差值)
+            # 为了防止某些通道无数据导致间距为0，做个保底判断
+            spacing = np.max(emg_data) - np.min(emg_data)
+            if spacing == 0:
+                spacing = 1.0 
+                
+            for channel in range(num_emg_channels):
+                # 为每个通道添加垂直偏移量实现堆叠
+                offset_data = emg_data[:, channel] + channel * spacing
+                ax1.plot(time_relative, offset_data, alpha=0.8)
+                
+            ax1.set_title('EMG Signals (All 16 Channels Stacked)', fontsize=14)
+            # 使用 y 轴刻度来标记通道名称，而不是使用图例 (图例会太拥挤)
+            ax1.set_yticks([i * spacing for i in range(num_emg_channels)])
+            ax1.set_yticklabels([f'CH {i+1}' for i in range(num_emg_channels)])
+            ax1.set_ylabel('Channels', fontsize=12)
             ax1.grid(True, linestyle='--', alpha=0.6)
             
             # --- 绘制子图 2: 关节角度 (Joint Angles) ---
-            # 我们只画前 3 个关节角度
+            # 为了清晰，依然只画前 3 个关节角度
             for joint in range(3):
-                ax2.plot(time_relative, joint_angles[:, joint], label=f'关节 {joint+1}', alpha=0.8)
-            ax2.set_title('真实关节角度 (Ground Truth Pose) - 前3个关节', fontsize=14)
-            ax2.set_xlabel('时间 (秒)', fontsize=12)
-            ax2.set_ylabel('角度 (弧度)', fontsize=12)
+                ax2.plot(time_relative, joint_angles[:, joint], label=f'Joint {joint+1}', alpha=0.8)
+            ax2.set_title('Ground Truth Pose (First 3 Joints)', fontsize=14)
+            ax2.set_xlabel('Time (s)', fontsize=12)
+            ax2.set_ylabel('Angle (rad)', fontsize=12)
             ax2.legend(loc='upper right')
             ax2.grid(True, linestyle='--', alpha=0.6)
             
