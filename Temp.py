@@ -1,113 +1,275 @@
 import os
 import glob
+import random
+import copy
 import h5py
 import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
 
-def print_hdf5_structure(name, obj):
-    """
-    回调函数：用于递归遍历并打印 HDF5 文件的内部结构
-    """
-    # 打印当前的路径名
-    indent = name.count('/') * '  '
-    if isinstance(obj, h5py.Group):
-        print(f"{indent}📁 组 (Group): {name}")
-        # 打印组的属性 (Metadata)
-        if obj.attrs:
-            print(f"{indent}   - 属性 (Attributes):")
-            for key, val in obj.attrs.items():
-                print(f"{indent}     * {key}: {val}")
-    elif isinstance(obj, h5py.Dataset):
-        print(f"{indent}📊 数据集 (Dataset): {name}")
-        print(f"{indent}   - 形状 (Shape): {obj.shape}")
-        print(f"{indent}   - 类型 (Dtype): {obj.dtype}")
-        # 如果是复合数据类型 (像 emg2pose 中的 timeseries)，打印内部字段
-        if obj.dtype.names:
-            print(f"{indent}   - 内部字段 (Fields): {obj.dtype.names}")
+from Model_SleepFM import Config, SleepFM_Finetune
+
+# ==========================================
+# 数据加载与处理模块
+# ==========================================
+def extract_windows_from_file(f_path, is_train):
+    windows, labels, valid_masks = [], [], []
+    with h5py.File(f_path, 'r') as f:
+        emg_data = f['emg'][:]
+        lbl_data = f['label'][:]
+        if isinstance(lbl_data[0], bytes):
+            lbl_data = [l.decode('utf-8') for l in lbl_data]
+            
+        # 记录微调数据集的真实通道有效性
+        num_c = emg_data.shape[1]
+        v_mask = np.zeros(Config.CHANNELS, dtype=bool)
+        v_mask[:min(num_c, Config.CHANNELS)] = True
+            
+        if num_c < Config.CHANNELS:
+            pad = np.zeros((emg_data.shape[0], Config.CHANNELS - num_c), dtype=np.float32)
+            emg_data = np.concatenate((emg_data, pad), axis=1)
+        else:
+            emg_data = emg_data[:, :Config.CHANNELS]
+            
+        if is_train:
+            step = int(Config.WINDOW_SIZE * 0.25)
+        else:
+            step = Config.WINDOW_SIZE             
+            
+        for i in range(0, len(emg_data) - Config.WINDOW_SIZE, step):
+            win_emg = emg_data[i : i + Config.WINDOW_SIZE].T 
+            win_lbl = lbl_data[i + Config.WINDOW_SIZE - 1]
+            windows.append(win_emg)
+            labels.append(win_lbl)
+            valid_masks.append(v_mask)
+            
+    return windows, labels, valid_masks
+
+class EMGFinetuneDataset(Dataset):
+    def __init__(self, windows, labels, valid_masks, label2idx, is_train=False):
+        self.windows = np.array(windows, dtype=np.float32)
+        self.labels = np.array([label2idx[l] for l in labels], dtype=np.longlong)
+        self.valid_masks = np.array(valid_masks, dtype=bool)
+        self.is_train = is_train
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        x = torch.tensor(self.windows[idx])
+        y = torch.tensor(self.labels[idx])
+        v_mask = torch.tensor(self.valid_masks[idx])
+        
+        if self.is_train:
+            if torch.rand(1).item() < 0.5:
+                noise = torch.randn_like(x) * 0.05
+                x = x + noise
+            if torch.rand(1).item() < 0.5:
+                scale = torch.empty(1).uniform_(0.8, 1.2).item()
+                x = x * scale
+                
+            # --- 软化：随机通道屏蔽 (Channel Masking) ---
+            # 概率降至 0.2，防止破坏过多特征导致模型坍塌
+            if torch.rand(1).item() < 0.2:
+                valid_indices = torch.nonzero(v_mask).squeeze()
+                if valid_indices.dim() == 0: 
+                    valid_indices = valid_indices.unsqueeze(0)
+                
+                # 最多只随机丢弃 1 个通道的数据
+                if len(valid_indices) > 2:
+                    num_drop = 1 
+                    perm = torch.randperm(len(valid_indices))
+                    drop_indices = valid_indices[perm[:num_drop]]
+                    x[drop_indices, :] = 0.0
+                
+        return x, y, v_mask
+
+def prepare_data():
+    files = glob.glob(os.path.join(Config.Finetune.HDF5_DIR, '*.hdf5'))
+    if len(files) == 0:
+        raise FileNotFoundError(f"No HDF5 files found in {Config.Finetune.HDF5_DIR}")
+        
+    if Config.Finetune.RANDOMIZE_FILE_LIST:
+        random.shuffle(files)
+    else:
+        files.sort()
+        
+    train_windows, train_labels, train_masks = [], [], []
+    test_windows, test_labels, test_masks = [], [], []
+    
+    if Config.Finetune.RANDOM_MIX_MODE:
+        target_files = files[:Config.Finetune.NUM_TRAIN_FILES + Config.Finetune.NUM_TEST_FILES]
+        all_win, all_lbl, all_msk = [], [], []
+        for f in target_files:
+            w, l, m = extract_windows_from_file(f, is_train=True) 
+            all_win.extend(w); all_lbl.extend(l); all_msk.extend(m)
+            
+        indices = np.arange(len(all_win))
+        np.random.shuffle(indices)
+        split = int(0.8 * len(indices))
+        train_idx, test_idx = indices[:split], indices[split:]
+        
+        train_windows = [all_win[i] for i in train_idx]
+        train_labels = [all_lbl[i] for i in train_idx]
+        train_masks = [all_msk[i] for i in train_idx]
+        test_windows = [all_win[i] for i in test_idx]
+        test_labels = [all_lbl[i] for i in test_idx]
+        test_masks = [all_msk[i] for i in test_idx]
+    else:
+        train_files = files[:Config.Finetune.NUM_TRAIN_FILES]
+        test_files = files[Config.Finetune.NUM_TRAIN_FILES : Config.Finetune.NUM_TRAIN_FILES + Config.Finetune.NUM_TEST_FILES]
+        
+        for f in train_files:
+            w, l, m = extract_windows_from_file(f, is_train=True)
+            train_windows.extend(w); train_labels.extend(l); train_masks.extend(m)
+        for f in test_files:
+            w, l, m = extract_windows_from_file(f, is_train=False)
+            test_windows.extend(w); test_labels.extend(l); test_masks.extend(m)
+            
+    unique_labels = sorted(list(set(train_labels + test_labels)))
+    label2idx = {l: i for i, l in enumerate(unique_labels)}
+    
+    print(f">> Dataset fully loaded. Train samples: {len(train_windows)}, Test samples: {len(test_windows)}")
+    return train_windows, train_labels, train_masks, test_windows, test_labels, test_masks, label2idx, unique_labels
+
+# ==========================================
+# 训练与评估逻辑
+# ==========================================
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    correct, total = 0, 0
+    total_loss = 0.0
+    all_preds, all_targets = [], []
+    
+    with torch.no_grad():
+        for x, y, v_mask in loader:
+            x, y, v_mask = x.to(device), y.to(device), v_mask.to(device)
+            outputs = model(x, valid_mask=v_mask)
+            loss = criterion(outputs, y)
+            total_loss += loss.item()
+            
+            _, predicted = torch.max(outputs.data, 1)
+            total += y.size(0)
+            correct += (predicted == y).sum().item()
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(y.cpu().numpy())
+            
+    acc = correct / total
+    avg_loss = total_loss / len(loader)
+    return avg_loss, acc, all_targets, all_preds
 
 def main():
-    # 1. 确定目标路径
-    data_dir = "./emg2pose_github/emg2pose_dataset_mini"
+    print(">> Preparing Data Pipeline...")
+    train_win, train_lbl, train_msk, test_win, test_lbl, test_msk, label2idx, classes = prepare_data()
     
-    # 查找目录下的所有 .hdf5 文件
-    search_pattern = os.path.join(data_dir, "*.hdf5")
-    hdf5_files = glob.glob(search_pattern)
+    train_dataset = EMGFinetuneDataset(train_win, train_lbl, train_msk, label2idx, is_train=True)
+    test_dataset = EMGFinetuneDataset(test_win, test_lbl, test_msk, label2idx, is_train=False)
     
-    if not hdf5_files:
-        print(f"❌ 在路径 {data_dir} 下没有找到任何 .hdf5 文件！")
-        print("请检查路径是否正确，或者数据集是否已经解压。")
-        return
+    train_loader = DataLoader(train_dataset, batch_size=Config.Finetune.BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=Config.Finetune.BATCH_SIZE, shuffle=False)
     
-    # 取第一个文件进行分析
-    file_path = hdf5_files[0]
-    print(f"✅ 找到文件: {file_path}")
-    print("-" * 50)
-    print("正在打印 HDF5 文件结构...\n")
+    model = SleepFM_Finetune(num_classes=len(classes)).to(Config.DEVICE)
     
-    # 2. 读取文件并打印结构
-    with h5py.File(file_path, 'r') as f:
-        # 遍历打印所有键名
-        f.visititems(print_hdf5_structure)
-        print("-" * 50)
-        
-        # 3. 提取数据并准备绘图
-        # 根据 emg2pose 的数据结构，数据应该在 'emg2pose/timeseries' 中
-        if 'emg2pose' in f and 'timeseries' in f['emg2pose']:
-            print("正在提取时间序列数据以供绘图...")
-            timeseries = f['emg2pose']['timeseries']
-            
-            # 提取前 2000 个采样点（如果是 2kHz 采样率，这就是 1 秒的数据）
-            # 避免一次性加载所有数据导致内存溢出或绘图卡顿
-            num_samples = 2000
-            
-            # 由于 timeseries 是复合数据集，我们可以通过字段名直接提取
-            time_data = timeseries['time'][:num_samples]
-            emg_data = timeseries['emg'][:num_samples]             # 形状: (num_samples, 16)
-            joint_angles = timeseries['joint_angles'][:num_samples] # 形状: (num_samples, 20)
-            
-            # 为了让 x 轴从 0 开始显示相对时间
-            time_relative = time_data - time_data[0]
-            
-            # 4. 使用 Matplotlib 绘制曲线
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-            
-            # --- 绘制子图 1: 肌电信号 (EMG) 所有通道堆叠显示 ---
-            num_emg_channels = emg_data.shape[1]
-            
-            # 计算一个合适的间距用于将信号堆叠 (使用信号幅度的最大差值)
-            # 为了防止某些通道无数据导致间距为0，做个保底判断
-            spacing = np.max(emg_data) - np.min(emg_data)
-            if spacing == 0:
-                spacing = 1.0 
-                
-            for channel in range(num_emg_channels):
-                # 为每个通道添加垂直偏移量实现堆叠
-                offset_data = emg_data[:, channel] + channel * spacing
-                ax1.plot(time_relative, offset_data, alpha=0.8)
-                
-            ax1.set_title('EMG Signals (All 16 Channels Stacked)', fontsize=14)
-            # 使用 y 轴刻度来标记通道名称，而不是使用图例 (图例会太拥挤)
-            ax1.set_yticks([i * spacing for i in range(num_emg_channels)])
-            ax1.set_yticklabels([f'CH {i+1}' for i in range(num_emg_channels)])
-            ax1.set_ylabel('Channels', fontsize=12)
-            ax1.grid(True, linestyle='--', alpha=0.6)
-            
-            # --- 绘制子图 2: 关节角度 (Joint Angles) ---
-            # 为了清晰，依然只画前 3 个关节角度
-            for joint in range(3):
-                ax2.plot(time_relative, joint_angles[:, joint], label=f'Joint {joint+1}', alpha=0.8)
-            ax2.set_title('Ground Truth Pose (First 3 Joints)', fontsize=14)
-            ax2.set_xlabel('Time (s)', fontsize=12)
-            ax2.set_ylabel('Angle (rad)', fontsize=12)
-            ax2.legend(loc='upper right')
-            ax2.grid(True, linestyle='--', alpha=0.6)
-            
-            plt.tight_layout()
-            plt.show()
-            
-        else:
-            print("❌ 文件中没有找到 'emg2pose/timeseries' 数据结构。")
-            print("可能这不是标准的 emg2pose 数据集文件，请参考上面的打印结构自行修改键名。")
+    # --- 调整：将 Dropout 从 0.5 降到适中的 0.4 ---
+    if hasattr(model, 'classifier') and isinstance(model.classifier, nn.Sequential):
+        model.classifier[0] = nn.Dropout(p=0.4)
+        print(">> Adjusted Dropout rate to 0.4.")
+    
+    pretrained_path = "sleepfm_pretrained_ep50.pth" 
+    if os.path.exists(pretrained_path):
+        state_dict = torch.load(pretrained_path)
+        encoder_dict = {k: v for k, v in state_dict.items() if k.startswith('encoder.')}
+        model.load_state_dict(encoder_dict, strict=False)
+        print(">> Successfully loaded Pre-trained Encoder weights!")
+    else:
+        print(">> No Pre-trained weights found. Training from scratch...")
 
-if __name__ == "__main__":
+    criterion = nn.CrossEntropyLoss()
+    # --- 修复：降低 weight_decay 并提高学习率，帮助模型跳出全部预测 rest 的局部最优 ---
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    
+    best_acc = 0.0
+    best_weights = None
+    patience = 5  
+    patience_counter = 0
+    
+    print("\n>> Starting Fine-tuning...")
+    for epoch in range(Config.Finetune.EPOCHS):
+        model.train()
+        total_loss = 0
+        correct, total = 0, 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{Config.Finetune.EPOCHS}")
+        
+        for x, y, v_mask in pbar:
+            x, y, v_mask = x.to(Config.DEVICE), y.to(Config.DEVICE), v_mask.to(Config.DEVICE)
+            
+            optimizer.zero_grad()
+            outputs = model(x, valid_mask=v_mask)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+            _, predicted = torch.max(outputs.data, 1)
+            total += y.size(0)
+            correct += (predicted == y).sum().item()
+            
+            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+            
+        train_loss = total_loss / len(train_loader)
+        train_acc = correct / total
+        
+        test_loss, test_acc, _, _ = evaluate(model, test_loader, criterion, Config.DEVICE)
+        print(f"Epoch {epoch+1} Completed | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
+        
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_weights = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+            print(f"[*] New best accuracy {best_acc*100:.2f}%. Model weights saved.")
+        else:
+            patience_counter += 1
+            print(f"[!] No improvement for {patience_counter} epochs.")
+            
+        if patience_counter >= patience:
+            print(f"\n>> Early stopping triggered at Epoch {epoch+1}! Model has started overfitting.")
+            break
+            
+    print("\n>> Training finished. Restoring best weights for final evaluation...")
+    if best_weights is not None:
+        model.load_state_dict(best_weights)
+        
+    final_loss, final_acc, targets, preds = evaluate(model, test_loader, criterion, Config.DEVICE)
+    
+    print(f"\n==================================================")
+    print(f"🌟 Best Model Final Test Accuracy: {final_acc*100:.2f}%")
+    print(f"==================================================\n")
+    
+    save_cm = True
+    if save_cm:
+        print("\nClassification Report:")
+        print(classification_report(targets, preds, target_names=classes, zero_division=0))
+        try:
+            plt.rcParams['font.family'] = 'sans-serif'
+            plt.rcParams['font.sans-serif'] = ['Arial']
+            cm = confusion_matrix(targets, preds)
+            cm_pct = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-10)
+            plt.figure(figsize=(12, 10))
+            ax = sns.heatmap(cm_pct, annot=True, fmt='.1%', cmap='Blues', xticklabels=classes, yticklabels=classes, annot_kws={"size": 30})
+            ax.set_xticklabels(ax.get_xticklabels(), fontsize=25); ax.set_yticklabels(ax.get_yticklabels(), fontsize=25)
+            cbar = ax.collections[0].colorbar
+            if cbar: cbar.ax.tick_params(labelsize=22)
+            plt.title(f'Confusion Matrix (Final Acc: {final_acc*100:.2f}%)', fontsize=30, pad=25)
+            plt.ylabel('True', fontsize=30, labelpad=15); plt.xlabel('Pred', fontsize=30, labelpad=15); plt.tight_layout(); plt.savefig('confusion_matrix.png', dpi=300)
+            print("Confusion matrix saved to 'confusion_matrix.png'")
+        except Exception as e: 
+            print(f"Error plotting CM: {e}")
+
+if __name__ == '__main__':
     main()
