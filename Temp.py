@@ -7,3 +7,10 @@ lerobot-teleoperate \
   --teleop.port=/dev/ttyACM1 \
   --teleop.id=jiao_leader_arm \
   --display_data=true
+
+
+(base) nvidia@nvidia-desktop:~$ xhost +
+access control disabled, clients can connect from any host
+(base) nvidia@nvidia-desktop:~$ sudo xhost +
+[sudo] password for nvidia: 
+access control disabled, clients can connect from any host
