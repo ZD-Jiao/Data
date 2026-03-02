@@ -1,3 +1,10 @@
+# 第一步：启动容器
+sudo docker start lerobot_v043
+
+# 第二步：进入容器（前面变成root@nvidia-desktop）
+sudo docker exec -it lerobot_v043 bash
+
+# teleoperate + cam
 lerobot-teleoperate \
   --robot.type=so101_follower \
   --robot.port=/dev/ttyACM0 \
@@ -9,11 +16,6 @@ lerobot-teleoperate \
   --display_data=true
 
 
-(base) nvidia@nvidia-desktop:~$ xhost +
-access control disabled, clients can connect from any host
-(base) nvidia@nvidia-desktop:~$ sudo xhost +
-[sudo] password for nvidia: 
-access control disabled, clients can connect from any host
 
 (base) root@nvidia-desktop:/workspace# lerobot-teleoperate   --robot.type=so101_follower   --robot.port=/dev/ttyACM0   --robot.id=jiao_follower_arm   --robot.cameras="{ front: {type: intelrealsense, serial_number_or_name: '242322077448', width: 640, height: 480, fps: 30} }"   --teleop.type=so101_leader   --teleop.port=/dev/ttyACM1   --teleop.id=jiao_leader_arm   --display_data=true
 INFO 2026-03-02 10:40:58 eoperate.py:188 {'display_data': True,
