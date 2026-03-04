@@ -73,8 +73,10 @@ class EMGFinetuneDataset(Dataset):
         v_mask = torch.tensor(self.valid_masks[idx])
         
         if self.is_train:
+            # 优化 1：针对极小数据量的极端增强 (噪声暴增至 30%)
+            # 彻底破坏模型对训练样本细节的死记硬背
             if torch.rand(1).item() < 0.2:
-                noise = torch.randn_like(x) * (x.std() * 0.15 + 1e-6)
+                noise = torch.randn_like(x) * (x.std() * 0.30 + 1e-6)
                 x = x + noise
                 
             if torch.rand(1).item() < 0.2:
@@ -228,39 +230,36 @@ def main():
         model.load_state_dict(encoder_dict, strict=False)
         print(">> Successfully loaded Pre-trained Encoder weights!")
         
+        # === 核心优化 2：彻底冻结主干网络 (Linear Probing 模式) ===
+        # 极小数据量下解冻 Transformer 必将引发毁灭性过拟合
         for param in model.encoder.parameters():
             param.requires_grad = False
         print(">> [STAGE 1] Frozen Encoder. Training classification head only...")
     else:
         print(">> No Pre-trained weights found. Training from scratch...")
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # 优化 3：增大标签平滑 (0.2)，强行压制分类器在小数据上的过度自信
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.2)
     
     optimizer_grouped_parameters = [
-        {'params': model.encoder.parameters(), 'lr': 1e-5},
+        # Encoder 保持冻结，不再分配学习率
         {'params': model.classifier.parameters(), 'lr': 3e-4}
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=1e-4)
     
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.Finetune.EPOCHS, eta_min=1e-6)
+    # 既然只训简单的分类头，恢复能快速收敛的 Plateau 调度器
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6)
     
     best_acc = 0.0
     best_weights = None
-    patience = 15 
+    patience = 20 # 冻结主干后，给分类头更长的试错时间
     patience_counter = 0
     
-    print("\n>> Starting Fine-tuning with Mean-Max Pooling Strategy...")
+    print("\n>> Starting Linear Probing (Frozen Backbone) with Extreme Augmentation...")
     for epoch in range(Config.Finetune.EPOCHS):
         
-        if epoch == 4 and os.path.exists(pretrained_path):
-            print("\n>> [STAGE 2] Unfreezing Encoder for global fine-tuning...")
-            for param in model.encoder.parameters():
-                param.requires_grad = True
-            
-            optimizer.param_groups[0]['lr'] = 1e-5     
-            optimizer.param_groups[1]['lr'] = 3e-4     
-            
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.Finetune.EPOCHS - epoch, eta_min=1e-6)
+        # === 移除解冻逻辑 ===
+        # 在小数据集上，我们从头到尾都只训练最后一层，依靠强大的预训练特征和 MeanMax 池化器
             
         model.train()
         total_loss = 0
@@ -290,10 +289,10 @@ def main():
         
         test_loss, test_acc, _, _ = evaluate(model, test_loader, criterion, Config.DEVICE)
         
-        scheduler.step()
+        scheduler.step(test_acc)
         
         current_lrs = [g['lr'] for g in optimizer.param_groups]
-        lr_str = f"LR:[{current_lrs[0]:.1e}, {current_lrs[-1]:.1e}]"
+        lr_str = f"LR:[{current_lrs[-1]:.1e}]"
         
         print(f"Epoch {epoch+1} Completed | {lr_str} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
         
