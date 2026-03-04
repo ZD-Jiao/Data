@@ -41,7 +41,10 @@ def extract_windows_from_file(f_path, is_train):
             emg_data = emg_data[:, :Config.CHANNELS]
             
         if is_train:
-            step = int(Config.WINDOW_SIZE * 0.25)
+            # === 优化 1：高密度采样 ===
+            # 将滑动步长从 0.25 降低至 0.125，相当于将训练样本密度翻倍！
+            # 极大地缓解数据量过小导致的欠拟合问题。
+            step = int(Config.WINDOW_SIZE * 0.125)
         else:
             step = Config.WINDOW_SIZE             
             
@@ -140,22 +143,16 @@ def prepare_data():
 # ==========================================
 class MeanMaxPooler(nn.Module):
     def forward(self, x, mask=None):
-        # x shape: [B, C, Hidden_Dim]
         if mask is not None:
-            mask_ext = mask.unsqueeze(-1) # [B, C, 1]
-            
-            # 1. 均值池化：完美继承预训练对比学习的全局肌肉状态
+            mask_ext = mask.unsqueeze(-1) 
             mean_pool = (x * mask_ext.float()).sum(dim=1) / mask_ext.float().sum(dim=1).clamp(min=1e-9)
-            
-            # 2. 最大值池化：专为无序通道设计，精准抓取大拇指/食指的单电极尖峰信号！
             x_masked = x.masked_fill(~mask_ext, -1e9)
             max_pool, _ = torch.max(x_masked, dim=1)
         else:
             mean_pool = x.mean(dim=1)
             max_pool, _ = torch.max(x, dim=1)
             
-        # 拼接特征：维度翻倍，同时拥有全局视野和尖峰捕捉能力
-        return torch.cat([mean_pool, max_pool], dim=-1) # [B, 2 * Hidden_Dim]
+        return torch.cat([mean_pool, max_pool], dim=-1) 
 
 class CustomSleepFMFinetune(nn.Module):
     def __init__(self, original_model, num_classes):
@@ -163,15 +160,17 @@ class CustomSleepFMFinetune(nn.Module):
         self.encoder = original_model.encoder
         hidden_dim = self.encoder.feature_dim
         
-        # 启用无需训练的双路池化器，不会产生初始化震荡
         self.pooler = MeanMaxPooler()
         
-        # 分类头接收翻倍的维度 (2 * hidden_dim)
+        # === 优化 2：引入特征对齐与脑容量释放 ===
+        # 增加 LayerNorm 防止 Max 的极值吃掉 Mean 的梯度
         self.classifier = nn.Sequential(
-            nn.Dropout(p=0.3),
+            nn.LayerNorm(hidden_dim * 2),  # 平滑拼接后的特征尺度
+            nn.Dropout(p=0.2),             # 降低 Dropout 释放容量
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(p=0.2),
+            nn.LayerNorm(hidden_dim),      # 稳定深层梯度
+            nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, num_classes)
         )
 
@@ -243,7 +242,6 @@ def main():
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=1e-4)
     
-    # 恢复表现优异且稳定的余弦退火
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.Finetune.EPOCHS, eta_min=1e-6)
     
     best_acc = 0.0
