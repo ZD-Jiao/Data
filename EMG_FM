@@ -41,9 +41,6 @@ def extract_windows_from_file(f_path, is_train):
             emg_data = emg_data[:, :Config.CHANNELS]
             
         if is_train:
-            # === 优化 1：高密度采样 ===
-            # 将滑动步长从 0.25 降低至 0.125，相当于将训练样本密度翻倍！
-            # 极大地缓解数据量过小导致的欠拟合问题。
             step = int(Config.WINDOW_SIZE * 0.125)
         else:
             step = Config.WINDOW_SIZE             
@@ -73,14 +70,13 @@ class EMGFinetuneDataset(Dataset):
         v_mask = torch.tensor(self.valid_masks[idx])
         
         if self.is_train:
-            # 优化 1：针对极小数据量的极端增强 (噪声暴增至 30%)
-            # 彻底破坏模型对训练样本细节的死记硬背
+            # 回归极其轻微的数据增强，保护波形细节
             if torch.rand(1).item() < 0.2:
-                noise = torch.randn_like(x) * (x.std() * 0.30 + 1e-6)
+                noise = torch.randn_like(x) * (x.std() * 0.1 + 1e-6)
                 x = x + noise
                 
             if torch.rand(1).item() < 0.2:
-                scale = torch.empty(1).uniform_(0.80, 1.20).item()
+                scale = torch.empty(1).uniform_(0.85, 1.15).item()
                 x = x * scale
                 
             if torch.rand(1).item() < 0.2:
@@ -140,49 +136,6 @@ def prepare_data():
     print(f">> Dataset fully loaded. Train samples: {len(train_windows)}, Test samples: {len(test_windows)}")
     return train_windows, train_labels, train_masks, test_windows, test_labels, test_masks, label2idx, unique_labels
 
-# ==========================================
-# === 终极无参特征捕获器：Mean + Max Pooling ===
-# ==========================================
-class MeanMaxPooler(nn.Module):
-    def forward(self, x, mask=None):
-        if mask is not None:
-            mask_ext = mask.unsqueeze(-1) 
-            mean_pool = (x * mask_ext.float()).sum(dim=1) / mask_ext.float().sum(dim=1).clamp(min=1e-9)
-            x_masked = x.masked_fill(~mask_ext, -1e9)
-            max_pool, _ = torch.max(x_masked, dim=1)
-        else:
-            mean_pool = x.mean(dim=1)
-            max_pool, _ = torch.max(x, dim=1)
-            
-        return torch.cat([mean_pool, max_pool], dim=-1) 
-
-class CustomSleepFMFinetune(nn.Module):
-    def __init__(self, original_model, num_classes):
-        super().__init__()
-        self.encoder = original_model.encoder
-        hidden_dim = self.encoder.feature_dim
-        
-        self.pooler = MeanMaxPooler()
-        
-        # === 优化 2：引入特征对齐与脑容量释放 ===
-        # 增加 LayerNorm 防止 Max 的极值吃掉 Mean 的梯度
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),  # 平滑拼接后的特征尺度
-            nn.Dropout(p=0.2),             # 降低 Dropout 释放容量
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim),      # 稳定深层梯度
-            nn.Dropout(p=0.1),
-            nn.Linear(hidden_dim, num_classes)
-        )
-
-    def forward(self, x, valid_mask=None):
-        features = self.encoder(x, valid_mask=valid_mask, return_sequence=True)
-        if features.dim() == 2:
-            raise ValueError("Encoder must return 3D sequence [B, C, H] for MeanMaxPooler!")
-            
-        pooled = self.pooler(features, valid_mask)
-        return self.classifier(pooled)
 
 # ==========================================
 # 训练与评估逻辑
@@ -220,8 +173,13 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=Config.Finetune.BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=Config.Finetune.BATCH_SIZE, shuffle=False)
     
-    base_model = SleepFM_Finetune(num_classes=len(classes))
-    model = CustomSleepFMFinetune(base_model, num_classes=len(classes)).to(Config.DEVICE)
+    # 彻底移除花哨的 Custom Pooler，直接使用最原始、最稳健的 SleepFM_Finetune
+    # (即 Transformer -> Mean Pooling -> Single Linear Layer)
+    model = SleepFM_Finetune(num_classes=len(classes)).to(Config.DEVICE)
+    
+    if hasattr(model, 'classifier') and isinstance(model.classifier, nn.Sequential):
+        # 极简分类头不需要太大的 Dropout，防止欠拟合
+        model.classifier[0] = nn.Dropout(p=0.1)
     
     pretrained_path = "sleepfm_pretrained_ep50.pth" 
     if os.path.exists(pretrained_path):
@@ -230,36 +188,55 @@ def main():
         model.load_state_dict(encoder_dict, strict=False)
         print(">> Successfully loaded Pre-trained Encoder weights!")
         
-        # === 核心优化 2：彻底冻结主干网络 (Linear Probing 模式) ===
-        # 极小数据量下解冻 Transformer 必将引发毁灭性过拟合
+        # 初始阶段：全部冻结
         for param in model.encoder.parameters():
             param.requires_grad = False
         print(">> [STAGE 1] Frozen Encoder. Training classification head only...")
     else:
         print(">> No Pre-trained weights found. Training from scratch...")
 
-    # 优化 3：增大标签平滑 (0.2)，强行压制分类器在小数据上的过度自信
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.2)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    optimizer_grouped_parameters = [
-        # Encoder 保持冻结，不再分配学习率
-        {'params': model.classifier.parameters(), 'lr': 3e-4}
+    # 为不同层分组，方便后续动态解冻
+    param_groups = [
+        {'params': model.classifier.parameters(), 'lr': 1e-4} # 分类头始终保持较高学习率
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
     
-    # 既然只训简单的分类头，恢复能快速收敛的 Plateau 调度器
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=4, min_lr=1e-6)
     
     best_acc = 0.0
     best_weights = None
-    patience = 20 # 冻结主干后，给分类头更长的试错时间
+    patience = 15 
     patience_counter = 0
     
-    print("\n>> Starting Linear Probing (Frozen Backbone) with Extreme Augmentation...")
+    print("\n>> Starting Gradual Unfreezing Finetuning Strategy...")
     for epoch in range(Config.Finetune.EPOCHS):
         
-        # === 移除解冻逻辑 ===
-        # 在小数据集上，我们从头到尾都只训练最后一层，依靠强大的预训练特征和 MeanMax 池化器
+        # === 核心策略：渐进式解冻 (Gradual Unfreezing) ===
+        
+        # 阶段 2：在 Epoch 4 解冻 Transformer 层
+        if epoch == 3 and os.path.exists(pretrained_path):
+            print("\n>> [STAGE 2] Unfreezing Transformer Layers...")
+            for param in model.encoder.channel_transformer.parameters():
+                param.requires_grad = True
+            
+            # 将新解冻的参数加入优化器，给予极小的学习率
+            optimizer.add_param_group({'params': model.encoder.channel_transformer.parameters(), 'lr': 1e-5})
+            
+            # 重置调度器
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=4, min_lr=1e-6)
+            
+        # 阶段 3：在 Epoch 7 解冻底层的 CNN 特征提取器
+        if epoch == 6 and os.path.exists(pretrained_path):
+            print("\n>> [STAGE 3] Unfreezing CNN Extractor (Full Network Unfrozen)...")
+            for param in model.encoder.channel_encoder.parameters():
+                param.requires_grad = True
+                
+            # 底层 CNN 更加敏感，给予比 Transformer 更小的学习率
+            optimizer.add_param_group({'params': model.encoder.channel_encoder.parameters(), 'lr': 5e-6})
+            
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=4, min_lr=1e-6)
             
         model.train()
         total_loss = 0
@@ -270,6 +247,7 @@ def main():
             x, y, v_mask = x.to(Config.DEVICE), y.to(Config.DEVICE), v_mask.to(Config.DEVICE)
                 
             optimizer.zero_grad()
+            # 恢复原生 SleepFM 的调用方式，不需要 return_sequence
             outputs = model(x, valid_mask=v_mask)
             loss = criterion(outputs, y)
                 
@@ -291,8 +269,9 @@ def main():
         
         scheduler.step(test_acc)
         
-        current_lrs = [g['lr'] for g in optimizer.param_groups]
-        lr_str = f"LR:[{current_lrs[-1]:.1e}]"
+        # 打印各层的学习率，监控解冻状态
+        lrs = [f"{g['lr']:.1e}" for g in optimizer.param_groups]
+        lr_str = f"LR:[{', '.join(lrs)}]"
         
         print(f"Epoch {epoch+1} Completed | {lr_str} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
         
