@@ -40,6 +40,7 @@ class ShadowHandTeaching:
         self._joint_state = {}
         self.poses = []
         self.start_time = time.monotonic()
+        self.teach_mode_enabled = False
 
         self.subscriber = rospy.Subscriber(
             "joint_states", JointState, self._joint_state_callback, queue_size=1
@@ -74,24 +75,50 @@ class ShadowHandTeaching:
         })
         print("已保存姿态 #{:d}".format(len(self.poses)))
 
+    def set_teach_mode(self, enabled):
+        """Release the hand for teaching, or restore trajectory control."""
+        if enabled == self.teach_mode_enabled:
+            return True
+
+        action = "进入示教模式（释放关节）" if enabled else "恢复轨迹控制"
+        print("正在{}，请稍候……".format(action))
+        try:
+            rospy.wait_for_service("/teach_mode", timeout=5.0)
+            self.hand.set_teach_mode(enabled)
+        except (rospy.ROSException, rospy.ServiceException, Exception) as exc:
+            # Some sr_robot_commander versions wrap the service exception in a
+            # package-specific exception, hence the final Exception fallback.
+            rospy.logerr("%s失败：%s", action, exc)
+            return False
+
+        self.teach_mode_enabled = enabled
+        print("已{}。".format(action))
+        return True
+
     def play(self):
         if not self.poses:
             print("没有可回放的姿态，请先按 S 示教。")
             return
 
+        if not self.set_teach_mode(False):
+            print("无法恢复轨迹控制，已取消回放。")
+            return
+
         print("开始顺序回放 {} 个姿态……".format(len(self.poses)))
-        for index, pose in enumerate(self.poses, start=1):
-            if rospy.is_shutdown():
-                return
-            print("  回放姿态 {}/{}".format(index, len(self.poses)))
-            try:
+        try:
+            for index, pose in enumerate(self.poses, start=1):
+                if rospy.is_shutdown():
+                    return
+                print("  回放姿态 {}/{}".format(index, len(self.poses)))
                 self.hand.move_to_joint_value_target(
                     pose["joints"], wait=True, angle_degrees=False
                 )
-            except Exception as exc:
-                rospy.logerr("姿态 %d 回放失败：%s", index, exc)
-                return
-        print("回放完成。")
+            print("回放完成。")
+        except Exception as exc:
+            rospy.logerr("姿态 %d 回放失败：%s", index, exc)
+        finally:
+            if not rospy.is_shutdown():
+                self.set_teach_mode(True)
 
     def save_csv(self):
         if not self.poses:
@@ -177,6 +204,10 @@ def main():
         rospy.logerr("5 秒内未收到完整的右手关节状态，请检查 joint_states。")
         return 1
 
+    if not teacher.set_teach_mode(True):
+        rospy.logerr("无法释放关节，示教程序终止。请检查 /teach_mode 服务。")
+        return 1
+
     print("就绪：S 保存姿态 | P 顺序回放 | C 保存 CSV | Q 退出")
     try:
         with KeyboardReader() as keyboard:
@@ -199,6 +230,9 @@ def main():
     except RuntimeError as exc:
         rospy.logerr("键盘读取失败：%s", exc)
         return 1
+    finally:
+        if teacher.teach_mode_enabled and not rospy.is_shutdown():
+            teacher.set_teach_mode(False)
     return 0
 
 
